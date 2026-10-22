@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	plog "github.com/pingcap/log"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -89,7 +90,18 @@ func newTikvClient(addr string) (tkvClient, error) {
 		logger.Infof("TiKV gc interval is set to %s", interval)
 	}
 
-	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","))
+	var opts []txnkv.ClientOpt
+	switch v := query.Get("api-version"); v {
+	case "", "1":
+		if query.Get("keyspace") != "" {
+			return nil, errors.New("TiKV keyspace requires api-version=2")
+		}
+	case "2":
+		opts = append(opts, txnkv.WithAPIVersion(kvrpcpb.APIVersion_V2), txnkv.WithKeyspace(query.Get("keyspace")))
+	default:
+		return nil, errors.Errorf("invalid TiKV api-version: %s", v)
+	}
+	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","), opts...)
 	if err != nil {
 		return nil, err
 	}
