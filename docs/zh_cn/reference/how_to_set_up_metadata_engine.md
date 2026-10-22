@@ -258,6 +258,27 @@ juicefs format \
     pics
 ```
 
+#### 使用 API V2 与 keyspace
+
+如果 TiKV 集群配置了 `storage.api-version = 2`，需要在元数据 URL 中设置 `api-version=2`。可选参数 `keyspace` 用于指定 keyspace，该 keyspace 需要事先在 PD 中创建：
+
+```shell
+juicefs format \
+    --storage s3 \
+    ... \
+    "tikv://192.168.1.6:2379,192.168.1.7:2379,192.168.1.8:2379/jfs?api-version=2&keyspace=jfs" \
+    pics
+```
+
+| 配置项        | 值                                                         |
+|---------------|------------------------------------------------------------|
+| `api-version` | TiKV API 版本，`1`（默认）或 `2`                           |
+| `keyspace`    | keyspace 名称，仅在 `api-version=2` 时有效；为空表示不使用 keyspace |
+
+:::note
+API V1 写入的数据无法通过 API V2 读取，反之亦然。同一个文件系统的所有客户端需要使用相同的参数。设置 `api-version=2` 后，除非显式设置了 `gc-interval`，客户端不会设置 GC safe point，详见 [TiKV 最佳实践](../administration/metadata/tikv_best_practices.md#垃圾回收)。
+:::
+
 #### 挂载文件系统
 
 ```shell

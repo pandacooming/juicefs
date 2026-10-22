@@ -34,6 +34,8 @@ TiKV 根据一个集群变量 `safe-point`（时间戳）来决定是否要清�
 ...
 ```
 
+在元数据 URL 中设置 `api-version=2` 时，即使指定了 keyspace，safe point 依然作用于整个集群，因此客户端默认不会设置它，而是交由集群负责 GC。如需开启，请显式设置 `gc-interval`。
+
 #### 主动设置 `safe-point`
 
 JuiceFS 客户端会周期性设置 `safe-point`，除此之外我们也可以通过 gc 子命令来主动设置。

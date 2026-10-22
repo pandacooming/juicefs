@@ -36,6 +36,8 @@ TiKV uses a cluster variable named `safe-point` (a timestamp) to decide whether 
     ...
     ```
 
+With `api-version=2` in the metadata URL, the safe point is still cluster-wide even when a keyspace is set, so the client does not set it by default and leaves GC to the cluster. Set `gc-interval` explicitly to enable it.
+
 #### Set `safe-point` manually
 
 In addition to the periodic updates performed by JuiceFS clients, you can use the `gc` subcommand to set `safe-point` manually.

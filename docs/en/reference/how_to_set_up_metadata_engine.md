@@ -271,6 +271,27 @@ juicefs format \
     pics
 ```
 
+#### Use API V2 and keyspaces
+
+If the TiKV cluster is configured with `storage.api-version = 2`, set `api-version=2` in the metadata URL. The optional `keyspace` parameter selects a keyspace, which must already exist in PD:
+
+```shell
+juicefs format \
+    --storage s3 \
+    ... \
+    "tikv://192.168.1.6:2379,192.168.1.7:2379,192.168.1.8:2379/jfs?api-version=2&keyspace=jfs" \
+    pics
+```
+
+| Name          | Value                                                                    |
+|---------------|--------------------------------------------------------------------------|
+| `api-version` | TiKV API version, `1` (default) or `2`                                   |
+| `keyspace`    | keyspace name, only valid with `api-version=2`; empty means no keyspace |
+
+:::note
+Data written with API V1 cannot be read with API V2, and vice versa. Use the same parameters for all clients of a file system. With `api-version=2`, the client does not set the GC safe point unless `gc-interval` is set, see [TiKV best practices](../administration/metadata/tikv_best_practices.md#garbage-collection).
+:::
+
 #### Mount a file system
 
 ```shell

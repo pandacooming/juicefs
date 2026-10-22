@@ -80,7 +80,19 @@ func newTikvClient(addr string) (tkvClient, error) {
 			query.Get("key"),
 			strings.Split(query.Get("verify-cn"), ","))
 	})
+	apiVersion, keyspace, err := parseTiKVAPIVersion(query)
+	if err != nil {
+		return nil, err
+	}
+	var opts []txnkv.ClientOpt
 	interval := time.Hour * 3
+	if apiVersion == kvrpcpb.APIVersion_V2 {
+		opts = append(opts, txnkv.WithAPIVersion(apiVersion), txnkv.WithKeyspace(keyspace))
+		// The GC safe point is cluster-wide even for a keyspace client, so leave
+		// GC to the cluster unless gc-interval is set explicitly.
+		interval = 0
+		logger.Infof("TiKV API V2 (keyspace %q): client GC is disabled unless gc-interval is set", keyspace)
+	}
 	if dur, err := time.ParseDuration(query.Get("gc-interval")); err == nil {
 		if dur != 0 && dur < time.Hour {
 			logger.Warnf("TiKV gc-interval (%s) is too short, and is reset to 1h", dur)
@@ -90,17 +102,6 @@ func newTikvClient(addr string) (tkvClient, error) {
 		logger.Infof("TiKV gc interval is set to %s", interval)
 	}
 
-	var opts []txnkv.ClientOpt
-	switch v := query.Get("api-version"); v {
-	case "", "1":
-		if query.Get("keyspace") != "" {
-			return nil, errors.New("TiKV keyspace requires api-version=2")
-		}
-	case "2":
-		opts = append(opts, txnkv.WithAPIVersion(kvrpcpb.APIVersion_V2), txnkv.WithKeyspace(query.Get("keyspace")))
-	default:
-		return nil, errors.Errorf("invalid TiKV api-version: %s", v)
-	}
 	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","), opts...)
 	if err != nil {
 		return nil, err
@@ -128,6 +129,22 @@ func newTikvClient(addr string) (tkvClient, error) {
 
 	prefix := strings.TrimLeft(tUrl.Path, "/")
 	return withPrefix(&tikvClient{client: client.KVStore, gcInterval: interval, changeLogShards: tiKVChangeLogShards(), volume: prefix}, append([]byte(prefix), 0xFD)), nil
+}
+
+// parseTiKVAPIVersion returns the TiKV API version and keyspace set in the meta URL.
+func parseTiKVAPIVersion(query url.Values) (kvrpcpb.APIVersion, string, error) {
+	keyspace := query.Get("keyspace")
+	switch v := query.Get("api-version"); v {
+	case "", "1":
+		if keyspace != "" {
+			return kvrpcpb.APIVersion_V1, "", errors.New("TiKV keyspace requires api-version=2")
+		}
+		return kvrpcpb.APIVersion_V1, "", nil
+	case "2":
+		return kvrpcpb.APIVersion_V2, keyspace, nil
+	default:
+		return kvrpcpb.APIVersion_V1, "", errors.Errorf("invalid TiKV api-version: %s", v)
+	}
 }
 
 type tikvTxn struct {

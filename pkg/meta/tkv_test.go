@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -301,6 +302,33 @@ func TestTiKVClient(t *testing.T) { //skip mutate
 	m, err := newKVMeta("tikv", "127.0.0.1:2379/jfs-unit-test", testConfig())
 	if err != nil || m.Name() != "tikv" {
 		t.Fatalf("create meta: %s", err)
+	}
+	testMeta(t, m)
+}
+
+func TestTiKVClientAPIVersion(t *testing.T) { //skip mutate
+	for addr, msg := range map[string]string{
+		"127.0.0.1:2379/jfs?keyspace=ks":                   "TiKV keyspace requires api-version=2",
+		"127.0.0.1:2379/jfs?api-version=1&keyspace=ks":     "TiKV keyspace requires api-version=2",
+		"127.0.0.1:2379/jfs?api-version=3":                 "invalid TiKV api-version: 3",
+		"127.0.0.1:2379/jfs?api-version=v2&keyspace=other": "invalid TiKV api-version: v2",
+	} {
+		if _, err := newKVMeta("tikv", addr, testConfig()); err == nil || !strings.Contains(err.Error(), msg) {
+			t.Fatalf("addr %s: expect error %q, got %v", addr, msg, err)
+		}
+	}
+
+	// TIKV_V2_ADDR points to a cluster with storage.api-version = 2, e.g. 127.0.0.1:2379/jfs-unit-test?api-version=2&keyspace=jfs
+	addr := os.Getenv("TIKV_V2_ADDR")
+	if addr == "" {
+		t.Skip("TIKV_V2_ADDR is not set")
+	}
+	m, err := newKVMeta("tikv", addr, testConfig())
+	if err != nil || m.Name() != "tikv" {
+		t.Fatalf("create meta: %s", err)
+	}
+	if c := m.(*kvMeta).client.(*prefixClient).tkvClient.(*tikvClient); c.gcInterval != 0 {
+		t.Fatalf("client GC should be disabled by default with API V2, got gc-interval %s", c.gcInterval)
 	}
 	testMeta(t, m)
 }
