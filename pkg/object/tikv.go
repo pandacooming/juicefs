@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	plog "github.com/pingcap/log"
 	"github.com/sirupsen/logrus"
 	"github.com/tikv/client-go/v2/config"
@@ -154,12 +155,22 @@ func newTiKV(endpoint, accesskey, secretkey, token string) (ObjectStorage, error
 	}
 
 	q := tUrl.Query()
-	c, err := rawkv.NewClient(context.TODO(), pds, config.NewSecurity(
+	opts := []rawkv.ClientOpt{rawkv.WithSecurity(config.NewSecurity(
 		q.Get("ca"),
 		q.Get("cert"),
 		q.Get("key"),
-		strings.Split(q.Get("verify-cn"), ",")))
-
+		strings.Split(q.Get("verify-cn"), ",")))}
+	switch v := q.Get("api-version"); v {
+	case "", "1":
+		if q.Get("keyspace") != "" {
+			return nil, fmt.Errorf("TiKV keyspace requires api-version=2")
+		}
+	case "2":
+		opts = append(opts, rawkv.WithAPIVersion(kvrpcpb.APIVersion_V2), rawkv.WithKeyspace(q.Get("keyspace")))
+	default:
+		return nil, fmt.Errorf("invalid TiKV api-version: %s", v)
+	}
+	c, err := rawkv.NewClientWithOpts(context.TODO(), pds, opts...)
 	if err != nil {
 		return nil, err
 	}

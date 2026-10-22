@@ -932,6 +932,12 @@ func TestMinIO(t *testing.T) {
 // }
 
 func TestTiKV(t *testing.T) { //skip mutate
+	for _, addr := range []string{"127.0.0.1:2379?keyspace=ks", "127.0.0.1:2379?api-version=3"} {
+		if _, err := newTiKV(addr, "", "", ""); err == nil {
+			t.Fatalf("newTiKV(%s) should fail", addr)
+		}
+	}
+	// TIKV_ADDR can also point to an API V2 cluster, e.g. 127.0.0.1:2379?api-version=2&keyspace=jfs
 	if os.Getenv("TIKV_ADDR") == "" {
 		t.SkipNow()
 	}

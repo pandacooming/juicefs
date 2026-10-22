@@ -1145,6 +1145,18 @@ juicefs format \
     myjfs
 ```
 
+#### Use API V2 and keyspaces
+
+If the TiKV cluster is configured with `storage.api-version = 2`, add `api-version=2` to the bucket URL. The optional `keyspace` parameter selects a keyspace, which must already exist in PD. For example:
+
+```bash
+juicefs format \
+    --storage tikv \
+    --bucket "<host>:<port>,<host>:<port>,<host>:<port>?api-version=2&keyspace=jfs" \
+    ... \
+    myjfs
+```
+
 ### etcd
 
 [etcd](https://etcd.io) is a small-scale key-value database with high availability and reliability, which can be used as both the metadata storage of JuiceFS and the data storage of JuiceFS.
