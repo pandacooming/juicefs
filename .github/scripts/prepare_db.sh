@@ -94,10 +94,33 @@ install_webdav() {
     nohup /home/travis/.m2/rclone-v1.57.0-linux-amd64/rclone serve webdav local --addr 127.0.0.1:9007 >>rclone.log 2>&1 &
 }
 
+# TiKV with storage.api-version = 2 on alternative ports, used by TIKV_V2_ADDR tests.
+install_tikv_v2() {
+    local dir=/tmp/tikv-v2
+    mkdir -p $dir
+    printf '[keyspace]\npre-alloc = ["jfs"]\n' > $dir/pd.toml
+    printf '[storage]\napi-version = 2\nenable-ttl = true\n[rocksdb]\nmax-open-files = 8192\n[raftdb]\nmax-open-files = 8192\n' > $dir/tikv.toml
+    docker run -d --name pd-v2 --network host -v $dir:/cfg pingcap/pd:v8.5.1 \
+        --name=pd-v2 --data-dir=/data/pd --client-urls=http://127.0.0.1:12379 --peer-urls=http://127.0.0.1:12380 --config=/cfg/pd.toml
+    docker run -d --name tikv-v2 --network host -v $dir:/cfg pingcap/tikv:v8.5.1 \
+        --addr=127.0.0.1:20260 --status-addr=127.0.0.1:20280 --data-dir=/data/tikv --pd=127.0.0.1:12379 --config=/cfg/tikv.toml
+    for i in $(seq 60); do
+        if curl -sf http://127.0.0.1:12379/pd/api/v2/keyspaces/jfs >/dev/null && \
+            curl -sf http://127.0.0.1:12379/pd/api/v1/stores | grep -q '"state_name": "Up"'; then
+            echo "TiKV (api-version=2) is running."
+            return 0
+        fi
+        sleep 1
+    done
+    docker logs tikv-v2 | tail -50
+    return 1
+}
+
 prepare_db() {
     case "$TEST" in
     "test.meta.core")
         retry install_tikv
+        install_tikv_v2
         install_mysql
         ;;
     "test.meta.non-core")

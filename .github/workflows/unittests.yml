@@ -66,6 +66,7 @@ jobs:
       CIFS_PASSWORD: secret
       WEBDAV_TEST_BUCKET: 127.0.0.1:9007
       TIKV_ADDR: 127.0.0.1
+      TIKV_V2_ADDR: 127.0.0.1:12379/jfs-unit-test?api-version=2&keyspace=jfs
       REDIS_ADDR: redis://127.0.0.1:6379/13
       ETCD_ADDR: 127.0.0.1:3379
       MYSQL_ADDR: (127.0.0.1:3306)/dev
