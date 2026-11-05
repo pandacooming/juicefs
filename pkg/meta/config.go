@@ -47,6 +47,7 @@ type Config struct {
 	OpenCacheLimit     uint64 // max number of files to cache (soft limit)
 	Heartbeat          time.Duration
 	SessionTimeout     time.Duration
+	SessionFence       bool // reject writes and new locks once the session was cleaned up by others (Redis only, experimental)
 	MountPoint         string
 	Subdir             string
 	AtimeMode          string

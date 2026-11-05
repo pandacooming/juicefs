@@ -7509,3 +7509,137 @@ func TestRedisLockIndexRelease(t *testing.T) {
 		t.Fatalf("locked$%d still lists plock inode after last owner released", r1.sid)
 	}
 }
+
+// TestRedisSessionFence covers SessionFence: once a session is cleaned up by
+// others, it must not commit any write or take any new lock, even on a file it
+// never locked, and a late heartbeat must not bring the session back.
+func TestRedisSessionFence(t *testing.T) {
+	newMeta := func(fence, init bool) *redisMeta {
+		conf := testConfig()
+		conf.SessionFence = fence
+		m, err := newRedisMeta("redis", "127.0.0.1:6379/10", conf)
+		if err != nil {
+			t.Fatalf("create meta: %s", err)
+		}
+		if init {
+			if err := m.Reset(); err != nil {
+				t.Fatalf("reset meta: %s", err)
+			}
+			if err := m.Init(testFormat(), false); err != nil {
+				t.Fatalf("init meta: %s", err)
+			}
+		} else if _, err := m.Load(true); err != nil {
+			t.Fatalf("load meta: %s", err)
+		}
+		if err := m.NewSession(true); err != nil {
+			t.Fatalf("new session: %s", err)
+		}
+		return m.(*redisMeta)
+	}
+	r1 := newMeta(true, true) // the client that freezes
+	defer r1.CloseSession()   // err ignored: the session was cleaned up below
+	r2 := newMeta(false, false)
+	defer r2.CloseSession()
+
+	ctx := Background()
+	var lockf, data, data2 Ino
+	attr := &Attr{}
+	for name, ino := range map[string]*Ino{"fence_lock": &lockf, "fence_data": &data, "fence_data2": &data2} {
+		if st := r1.Create(ctx, 1, name, 0644, 0, 0, ino, attr); st != 0 {
+			t.Fatalf("create %s: %s", name, st)
+		}
+		defer r2.Unlink(ctx, 1, name)
+	}
+	write := func(m *redisMeta, inode Ino) syscall.Errno {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			return st
+		}
+		return m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 4096, Len: 4096}, time.Now())
+	}
+
+	// lock through one file and write through another, as most applications do
+	if st := r1.Flock(ctx, lockf, 1, syscall.F_WRLCK, false); st != 0 {
+		t.Fatalf("flock: %s", st)
+	}
+	if st := write(r1, data); st != 0 {
+		t.Fatalf("write before cleanup: %s", st)
+	}
+
+	// the session is considered stale and cleaned up by another client
+	if err := r2.doCleanStaleSession(r1.sid); err != nil {
+		t.Fatalf("clean up session %d: %s", r1.sid, err)
+	}
+	if st := r2.Flock(ctx, lockf, 2, syscall.F_WRLCK, false); st != 0 {
+		t.Fatalf("lock should be granted to others after cleanup: %s", st)
+	}
+
+	if st := write(r1, data); st != syscall.EIO {
+		t.Fatalf("write after cleanup: expect EIO, got %s", st)
+	}
+	if st := r1.Truncate(ctx, data, 0, 0, attr, false); st != syscall.EIO {
+		t.Fatalf("truncate after cleanup: expect EIO, got %s", st)
+	}
+	var length uint64
+	if st := r1.Fallocate(ctx, data, 0, 0, 8192, &length); st != syscall.EIO {
+		t.Fatalf("fallocate after cleanup: expect EIO, got %s", st)
+	}
+	var copied, outLength uint64
+	if st := r1.CopyFileRange(ctx, data, 0, data2, 0, 4096, 0, &copied, &outLength); st != syscall.EIO {
+		t.Fatalf("copy_file_range after cleanup: expect EIO, got %s", st)
+	}
+	if st := r1.Flock(ctx, data, 3, syscall.F_RDLCK, false); st != syscall.EIO {
+		t.Fatalf("flock after cleanup: expect EIO, got %s", st)
+	}
+	if st := r1.Setlk(ctx, data, 3, false, syscall.F_WRLCK, 0, 100, 1); st != syscall.EIO {
+		t.Fatalf("setlk after cleanup: expect EIO, got %s", st)
+	}
+
+	// a late heartbeat must not resurrect the session
+	if err := r1.doRefreshSession(); err == nil {
+		t.Fatal("refresh should fail after the session was cleaned up")
+	}
+	if ok, err := r2.rdb.HExists(ctx, r2.sessionInfos(), strconv.FormatUint(r1.sid, 10)).Result(); err != nil || ok {
+		t.Fatalf("session %d was resurrected (%v): %v", r1.sid, ok, err)
+	}
+	if st := write(r2, data); st != 0 {
+		t.Fatalf("other clients should keep writing: %s", st)
+	}
+
+	// a client that closes its own session can keep working and reopen it
+	r4 := newMeta(true, false)
+	defer r4.CloseSession()
+	if err := r4.CloseSession(); err != nil {
+		t.Fatalf("close session %d: %s", r4.sid, err)
+	}
+	if st := write(r4, data); st != 0 {
+		t.Fatalf("write after closing own session: %s", st)
+	}
+	if err := r4.NewSession(true); err != nil {
+		t.Fatalf("reopen session %d: %s", r4.sid, err)
+	}
+	if st := r4.Flock(ctx, data, 4, syscall.F_WRLCK, false); st != 0 {
+		t.Fatalf("flock after reopening session: %s", st)
+	}
+	_ = r4.Flock(ctx, data, 4, syscall.F_UNLCK, false)
+
+	// a client that finds its own session expired (e.g. after a long pause) is fenced as well
+	r5 := newMeta(true, false)
+	defer r5.CloseSession()
+	if err := r5.doCleanStaleSession(r5.sid); err != nil {
+		t.Fatalf("clean up own session %d: %s", r5.sid, err)
+	}
+	if st := write(r5, data); st != syscall.EIO {
+		t.Fatalf("write after cleaning up own session: expect EIO, got %s", st)
+	}
+
+	// without SessionFence, a cleaned-up session can still write (the default behavior)
+	r3 := newMeta(false, false)
+	defer r3.CloseSession()
+	if err := r2.doCleanStaleSession(r3.sid); err != nil {
+		t.Fatalf("clean up session %d: %s", r3.sid, err)
+	}
+	if st := write(r3, data); st != 0 {
+		t.Fatalf("write without SessionFence: %s", st)
+	}
+}

@@ -96,6 +96,8 @@ type redisMeta struct {
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
 	cache      *redisCache
+	fenced     atomic.Bool // the session was cleaned up by others (SessionFence)
+	closed     atomic.Bool // the session was closed by this client itself
 }
 
 var _ Meta = (*redisMeta)(nil)
@@ -470,7 +472,20 @@ func (m *redisMeta) doNewSession(sinfo []byte, update bool) error {
 	ctx := Background()
 	ssid := strconv.FormatUint(m.sid, 10)
 	expire := m.expireTime()
+	reopen := m.closed.Swap(false)
+	if m.fencing() && update && !reopen {
+		// never resurrect a session that was cleaned up by others while we were away
+		if n, err := m.rdb.Exists(ctx, m.fenceKey(m.sid)).Result(); err != nil {
+			return fmt.Errorf("check fence of session %d: %s", m.sid, err)
+		} else if n == 0 {
+			m.setFenced()
+			return fmt.Errorf("session %d was cleaned up by others", m.sid)
+		}
+	}
 	_, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		if m.fencing() && (!update || reopen) {
+			pipe.Set(ctx, m.fenceKey(m.sid), "1", 0)
+		}
 		pipe.ZAdd(ctx, m.allSessions(), redis.Z{Score: float64(expire), Member: ssid})
 		pipe.HSet(ctx, m.sessionInfos(), ssid, sinfo)
 		m.genLog(ctx, pipe, time.Now(), "NEWSESSION(%d,%d,%s)", m.sid, expire, logEncode(sinfo))
@@ -679,6 +694,96 @@ func (m *redisMeta) sustained(sid uint64) string {
 
 func (m *redisMeta) lockedKey(sid uint64) string {
 	return m.prefix + "locked" + strconv.FormatUint(sid, 10)
+}
+
+// fenceKey exists while the session is alive; it is deleted before the locks of a stale session are released.
+func (m *redisMeta) fenceKey(sid uint64) string {
+	return m.prefix + "fence" + strconv.FormatUint(sid, 10)
+}
+
+func (m *redisMeta) fencing() bool {
+	return m.conf.SessionFence && m.sid > 0 && !m.conf.ReadOnly && !m.closed.Load()
+}
+
+// withFence adds the fence key of the current session to the keys watched by a transaction.
+func (m *redisMeta) withFence(keys ...string) []string {
+	if m.fencing() {
+		keys = append(keys, m.fenceKey(m.sid))
+	}
+	return keys
+}
+
+func (m *redisMeta) setFenced() {
+	if m.fenced.CompareAndSwap(false, true) {
+		logger.Errorf("Session %d was cleaned up by others, reject all writes and lock requests from now on", m.sid)
+	}
+}
+
+// getWithFence reads a key and checks the fence in one round trip; the transaction must watch the fence key.
+func (m *redisMeta) getWithFence(ctx Context, tx *redis.Tx, key string) ([]byte, error) {
+	if !m.fencing() {
+		return tx.Get(ctx, key).Bytes()
+	}
+	if m.fenced.Load() {
+		return nil, syscall.EIO
+	}
+	var get *redis.StringCmd
+	var exists *redis.IntCmd
+	_, _ = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		get = pipe.Get(ctx, key)
+		exists = pipe.Exists(ctx, m.fenceKey(m.sid))
+		return nil
+	})
+	if n, err := exists.Result(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		m.setFenced()
+		return nil, syscall.EIO
+	}
+	return get.Bytes()
+}
+
+// hgetAllWithFence is like getWithFence, for a hash.
+func (m *redisMeta) hgetAllWithFence(ctx Context, tx *redis.Tx, key string) (map[string]string, error) {
+	if !m.fencing() {
+		return tx.HGetAll(ctx, key).Result()
+	}
+	if m.fenced.Load() {
+		return nil, syscall.EIO
+	}
+	var hgetall *redis.MapStringStringCmd
+	var exists *redis.IntCmd
+	_, _ = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		hgetall = pipe.HGetAll(ctx, key)
+		exists = pipe.Exists(ctx, m.fenceKey(m.sid))
+		return nil
+	})
+	if n, err := exists.Result(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		m.setFenced()
+		return nil, syscall.EIO
+	}
+	return hgetall.Result()
+}
+
+// checkFence must be called inside a transaction that watches the fence key (see withFence).
+func (m *redisMeta) checkFence(ctx Context, tx *redis.Tx) error {
+	if !m.fencing() {
+		return nil
+	}
+	if m.fenced.Load() {
+		return syscall.EIO
+	}
+	n, err := tx.Exists(ctx, m.fenceKey(m.sid)).Result()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		m.setFenced()
+		return syscall.EIO
+	}
+	return nil
 }
 
 func (m *redisMeta) symKey(inode Ino) string {
@@ -1228,7 +1333,7 @@ func (m *redisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint6
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		*delta = dirStat{}
 		var t Attr
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		a, err := m.getWithFence(ctx, tx, m.inodeKey(inode))
 		if err != nil {
 			return err
 		}
@@ -1313,14 +1418,14 @@ func (m *redisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint6
 			*attr = t
 		}
 		return err
-	}, m.inodeKey(inode)))
+	}, m.withFence(m.inodeKey(inode))...))
 }
 
 func (m *redisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, delta *dirStat, attr *Attr) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		*delta = dirStat{}
 		t := Attr{}
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		a, err := m.getWithFence(ctx, tx, m.inodeKey(inode))
 		if err != nil {
 			return err
 		}
@@ -1383,7 +1488,7 @@ func (m *redisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, 
 			*attr = t
 		}
 		return err
-	}, m.inodeKey(inode)))
+	}, m.withFence(m.inodeKey(inode))...))
 }
 
 func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr, oldAttr *Attr) syscall.Errno {
@@ -2997,8 +3102,22 @@ func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*En
 
 func (m *redisMeta) doCleanStaleSession(sid uint64) error {
 	var fail bool
-	// release locks
 	var ctx = Background()
+	// fence the session before releasing its locks, so it can't commit any write after others get the locks
+	if err := m.rdb.Del(ctx, m.fenceKey(sid)).Err(); err != nil {
+		return fmt.Errorf("fence session %d: %s", sid, err)
+	}
+	if sid == m.sid {
+		m.sesMu.Lock()
+		closing := m.umounting
+		m.sesMu.Unlock()
+		if closing {
+			m.closed.Store(true) // closed by CloseSession, may be reopened by NewSession
+		} else if m.fencing() {
+			m.setFenced() // e.g. found expired by our own cleaner after a long pause
+		}
+	}
+	// release locks
 	ssid := strconv.FormatInt(int64(sid), 10)
 	key := m.lockedKey(sid)
 	if inodes, err := m.rdb.SMembers(ctx, key).Result(); err == nil {
@@ -3105,6 +3224,17 @@ func (m *redisMeta) doFindStaleSessions(limit int) ([]uint64, error) {
 func (m *redisMeta) doRefreshSession() error {
 	ctx := Background()
 	ssid := strconv.FormatUint(m.sid, 10)
+	if m.fencing() {
+		if m.fenced.Load() {
+			return fmt.Errorf("session %d is fenced", m.sid)
+		}
+		if n, err := m.rdb.Exists(ctx, m.fenceKey(m.sid)).Result(); err != nil {
+			return err
+		} else if n == 0 {
+			m.setFenced()
+			return fmt.Errorf("session %d was cleaned up by others", m.sid)
+		}
+	}
 	expire := m.expireTime()
 	var created *redis.BoolCmd
 	_, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -3201,7 +3331,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		*delta = dirStat{}
 		*attr = Attr{}
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		a, err := m.getWithFence(ctx, tx, m.inodeKey(inode))
 		if err != nil {
 			return err
 		}
@@ -3240,7 +3370,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 			*numSlices = int(rpush.Val())
 		}
 		return err
-	}, m.inodeKey(inode)))
+	}, m.withFence(m.inodeKey(inode))...))
 }
 
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
@@ -3255,6 +3385,9 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 	defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
 	err := m.txn(ctx, func(tx *redis.Tx) error {
 		newLength, newSpace = 0, 0
+		if err := m.checkFence(ctx, tx); err != nil {
+			return err
+		}
 		rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
 		if err != nil {
 			return err
@@ -3375,7 +3508,7 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			}
 		}
 		return err
-	}, m.inodeKey(fout), m.inodeKey(fin))
+	}, m.withFence(m.inodeKey(fout), m.inodeKey(fin))...)
 	if err == nil {
 		m.updateParentStat(ctx, fout, attr.Parent, newLength, newSpace)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, newSpace, 0)

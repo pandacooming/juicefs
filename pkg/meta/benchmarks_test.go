@@ -646,3 +646,45 @@ func BenchmarkTKV(b *testing.B) {
 	m := NewClient(addr, nil)
 	benchmarkAll(b, m)
 }
+
+func benchFlock(b *testing.B, m Meta) {
+	var parent Ino
+	if err := prepareParent(m, "benchFlock", &parent); err != nil {
+		b.Fatal(err)
+	}
+	ctx := Background()
+	var inode Ino
+	if err := m.Create(ctx, parent, "file", 0644, 022, 0, &inode, nil); err != 0 {
+		b.Fatalf("create: %s", err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := m.Flock(ctx, inode, 1, syscall.F_WRLCK, false); err != 0 {
+			b.Fatalf("flock: %s", err)
+		}
+		if err := m.Flock(ctx, inode, 1, syscall.F_UNLCK, false); err != 0 {
+			b.Fatalf("unlock: %s", err)
+		}
+	}
+}
+
+// BenchmarkRedisSessionFence compares the paths guarded by SessionFence with and without it.
+func BenchmarkRedisSessionFence(b *testing.B) {
+	for _, fence := range []bool{false, true} {
+		b.Run(fmt.Sprintf("fence=%v", fence), func(b *testing.B) {
+			conf := DefaultConf()
+			conf.SessionFence = fence
+			conf.NoCompact = true
+			m := NewClient(redisAddr, conf)
+			_ = m.Init(&Format{Name: "benchmarkFence", DirStats: true}, true)
+			if err := m.NewSession(true); err != nil {
+				b.Fatalf("new session: %s", err)
+			}
+			defer m.CloseSession()
+			m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+			m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+			b.Run("write", func(b *testing.B) { benchWrite(b, m) })
+			b.Run("flock", func(b *testing.B) { benchFlock(b, m) })
+		})
+	}
+}

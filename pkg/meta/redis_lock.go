@@ -63,7 +63,7 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 	var err error
 	for {
 		err = r.txn(ctx, func(tx *redis.Tx) error {
-			owners, err := tx.HGetAll(ctx, ikey).Result()
+			owners, err := r.hgetAllWithFence(ctx, tx, ikey)
 			if err != nil {
 				return err
 			}
@@ -92,7 +92,7 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 				return nil
 			})
 			return err
-		}, ikey)
+		}, r.withFence(ikey)...)
 
 		if !block || err != syscall.EAGAIN {
 			break
@@ -186,7 +186,7 @@ func (r *redisMeta) Setlk(ctx Context, inode Ino, owner uint64, block bool, ltyp
 				})
 				return err
 			}
-			owners, err := tx.HGetAll(ctx, ikey).Result()
+			owners, err := r.hgetAllWithFence(ctx, tx, ikey)
 			if err != nil {
 				return err
 			}
@@ -213,7 +213,7 @@ func (r *redisMeta) Setlk(ctx Context, inode Ino, owner uint64, block bool, ltyp
 				return nil
 			})
 			return err
-		}, ikey)
+		}, r.withFence(ikey)...)
 
 		if !block || err != syscall.EAGAIN {
 			break
