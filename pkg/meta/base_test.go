@@ -5594,6 +5594,89 @@ func TestReloadRetriesFailedCallbacks(t *testing.T) {
 }
 
 // TestQuotaEdgeCases
+// TestStaleDirParents covers directory parents cached by one client going
+// stale after another client moves directories (#7807).
+func TestStaleDirParents(t *testing.T) {
+	newPair := func(t *testing.T, addr string) (Meta, Meta) {
+		mx := NewClient(addr, testConfig())
+		if err := mx.Reset(); err != nil {
+			t.Fatalf("reset: %s", err)
+		}
+		if err := mx.Init(testFormat(), false); err != nil {
+			t.Fatalf("init: %s", err)
+		}
+		my := NewClient(addr, testConfig())
+		if _, err := my.Load(true); err != nil {
+			t.Fatalf("load: %s", err)
+		}
+		for _, m := range []Meta{mx, my} {
+			if err := m.NewSession(true); err != nil {
+				t.Fatalf("new session: %s", err)
+			}
+		}
+		t.Cleanup(func() {
+			_ = mx.CloseSession()
+			_ = my.CloseSession()
+		})
+		return mx, my
+	}
+	for name, addr := range map[string]string{
+		"sqlite": "sqlite3://" + t.TempDir() + "/dirparents.db",
+		"redis":  "redis://127.0.0.1:6379/10",
+	} {
+		t.Run(name, func(t *testing.T) {
+			mx, my := newPair(t, addr)
+			testStaleDirParents(t, mx, my)
+		})
+	}
+}
+
+func testStaleDirParents(t *testing.T, mx, my Meta) {
+	ctx := Background()
+	var a, b, ino Ino
+	attr := &Attr{}
+	if st := my.Mkdir(ctx, RootInode, "a", 0755, 0, 0, &a, attr); st != 0 {
+		t.Fatalf("mkdir a: %s", st)
+	}
+	if st := my.Mkdir(ctx, a, "b", 0755, 0, 0, &b, attr); st != 0 {
+		t.Fatalf("mkdir a/b: %s", st)
+	}
+	// X caches parent(a)=root and parent(b)=a
+	if st := mx.Lookup(ctx, RootInode, "a", &ino, attr, false); st != 0 {
+		t.Fatalf("lookup a: %s", st)
+	}
+	if st := mx.Lookup(ctx, a, "b", &ino, attr, false); st != 0 {
+		t.Fatalf("lookup a/b: %s", st)
+	}
+	// Y swaps the nesting to /b/a
+	if st := my.Rename(ctx, a, "b", RootInode, "b", 0, &ino, attr); st != 0 {
+		t.Fatalf("rename a/b to b: %s", st)
+	}
+	if st := my.Rename(ctx, RootInode, "a", b, "a", 0, &ino, attr); st != 0 {
+		t.Fatalf("rename a to b/a: %s", st)
+	}
+	// X refreshes parent(a)=b only, so its cache now has a loop a -> b -> a
+	if st := mx.GetAttr(ctx, a, attr); st != 0 {
+		t.Fatalf("getattr a: %s", st)
+	}
+
+	run := func(op string, f func() syscall.Errno) {
+		done := make(chan syscall.Errno, 1)
+		go func() { done <- f() }()
+		select {
+		case st := <-done:
+			if st != 0 {
+				t.Fatalf("%s: %s", op, st)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s hangs on stale directory parents", op)
+		}
+	}
+	run("mkdir b/a/c", func() syscall.Errno { return mx.Mkdir(ctx, a, "c", 0755, 0, 0, &ino, attr) })
+	var total, avail, iused, iavail uint64
+	run("statfs b/a", func() syscall.Errno { return mx.StatFS(ctx, a, &total, &avail, &iused, &iavail) })
+}
+
 func TestQuotaEdgeCases(t *testing.T) {
 	m := &baseMeta{}
 
